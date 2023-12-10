@@ -322,7 +322,7 @@ class LimeTextExplainer(object):
                          labels=(1,),
                          top_labels=None,
                          num_features=10,
-                         num_samples=50,
+                         num_samples=5000,
                          distance_metric='cosine',
                          model_regressor=None):
         """Generates explanations for a prediction.
@@ -362,28 +362,15 @@ class LimeTextExplainer(object):
         domain_mapper = TextDomainMapper(indexed_string)
 
 
-        data, _yss, distances = self.__data_labels_distances(
+        data, yss, distances = self.__data_labels_distances(
             indexed_string, classifier_fn, query, num_samples,
             distance_metric=distance_metric)
 
 
         logging.info(data)
-        logging.info(_yss)
+        logging.info(yss)
         logging.info(distances)
 
-        def ordering_distance_func(orderings):
-            import scipy.stats as stats
-            o = orderings[0]
-            nsamples = len(orderings)
-            reg_scores = np.zeros(nsamples)
-
-            for i in range(nsamples):
-                reg_scores[i] = stats.kendalltau(o,orderings[i]).statistic
-
-            return reg_scores
-
-
-        yss = ordering_distance_func(_yss)
 
         if self.class_names is None:
             self.class_names = [str(x) for x in range(yss[0].shape[0])]

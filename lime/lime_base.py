@@ -3,9 +3,25 @@ Contains abstract functionality for learning locally linear sparse model.
 """
 import numpy as np
 import scipy as sp
-from sklearn.linear_model import Ridge, lars_path
+from sklearn.linear_model import Ridge, lars_path,LinearRegression,SGDRegressor
 from sklearn.utils import check_random_state
+from Losses.listNet import listNet 
 
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+class WeightedRegression(nn.Module):
+    def __init__(self, input_dim, ndocs):
+        super(WeightedRegression, self).__init__()
+        self.linear = nn.Linear(input_dim, ndocs)  
+
+    def forward(self, x):
+        return self.linear(x)
+
+def custom_loss_function(predicted_ranking, actual_ranking, weight):
+    loss = listNet(predicted_ranking, actual_ranking, weight)
+    return loss
 
 class LimeBase(object):
     """Class for learning a locally linear sparse model from perturbed data"""
@@ -75,43 +91,43 @@ class LimeBase(object):
         elif method == 'forward_selection':
             return self.forward_selection(data, labels, weights, num_features)
         elif method == 'highest_weights':
-            clf = Ridge(alpha=0.01, fit_intercept=True,
-                        random_state=self.random_state)
-            clf.fit(data, labels, sample_weight=weights)
+            
+            nvocab = data.shape[1]
+            ndocs = labels.shape[1]
+            fs_model = WeightedRegression(nvocab,ndocs)
+            optimizer = optim.SGD(fs_model.parameters(), lr=0.01)
 
-            coef = clf.coef_
-            if sp.sparse.issparse(data):
-                coef = sp.sparse.csr_matrix(clf.coef_)
-                weighted_data = coef.multiply(data[0])
-                # Note: most efficient to slice the data before reversing
-                sdata = len(weighted_data.data)
-                argsort_data = np.abs(weighted_data.data).argsort()
-                # Edge case where data is more sparse than requested number of feature importances
-                # In that case, we just pad with zero-valued features
-                if sdata < num_features:
-                    nnz_indexes = argsort_data[::-1]
-                    indices = weighted_data.indices[nnz_indexes]
-                    num_to_pad = num_features - sdata
-                    indices = np.concatenate((indices, np.zeros(num_to_pad, dtype=indices.dtype)))
-                    indices_set = set(indices)
-                    pad_counter = 0
-                    for i in range(data.shape[1]):
-                        if i not in indices_set:
-                            indices[pad_counter + sdata] = i
-                            pad_counter += 1
-                            if pad_counter >= num_to_pad:
-                                break
-                else:
-                    nnz_indexes = argsort_data[sdata - num_features:sdata][::-1]
-                    indices = weighted_data.indices[nnz_indexes]
-                return indices
-            else:
-                weighted_data = coef * data[0]
-                feature_weights = sorted(
-                    zip(range(data.shape[1]), weighted_data),
-                    key=lambda x: np.abs(x[1]),
-                    reverse=True)
-                return np.array([x[0] for x in feature_weights[:num_features]])
+            X_train = torch.from_numpy(data).float()
+            y_train = torch.from_numpy(labels)
+            print('X_train: ',X_train.shape)
+            print('y_train: ',y_train.shape)
+
+            for epoch in range(1000):
+                fs_model.train()
+                optimizer.zero_grad()
+
+                predictions = fs_model(X_train)
+
+                loss = custom_loss_function(predictions, y_train, weights)
+
+                loss.backward()
+                optimizer.step()
+
+                if epoch % 100 == 0:
+                    print(f'Epoch {epoch}, Loss: {loss.item()}')
+
+
+            coef =  fs_model.linear.weight.data.mean(dim=0)
+            print('coef: ',coef.shape)
+
+            
+            weighted_data = coef * data[0]
+            feature_weights = sorted(
+                zip(range(data.shape[1]), weighted_data),
+                key=lambda x: np.abs(x[1]),
+                reverse=True)
+            return np.array([x[0] for x in feature_weights[:num_features]])
+        
         elif method == 'lasso_path':
             weighted_data = ((data - np.average(data, axis=0, weights=weights))
                              * np.sqrt(weights[:, np.newaxis]))
@@ -178,30 +194,58 @@ class LimeBase(object):
             local_pred is the prediction of the explanation model on the original instance
         """
 
-        weights = self.kernel_fn(distances)
-        labels_column = neighborhood_labels
+
+        nvocab = neighborhood_data.shape[1]
+        ndocs = neighborhood_labels.shape[1]
+        weights = self.kernel_fn(distances) 
+
+
         used_features = self.feature_selection(neighborhood_data,
-                                               labels_column,
+                                               neighborhood_labels,
                                                weights,
                                                num_features,
-                                               feature_selection)
-        if model_regressor is None:
-            model_regressor = Ridge(alpha=1, fit_intercept=True,
-                                    random_state=self.random_state)
-        easy_model = model_regressor
-        easy_model.fit(neighborhood_data[:, used_features],
-                       labels_column, sample_weight=weights)
-        prediction_score = easy_model.score(
-            neighborhood_data[:, used_features],
-            labels_column, sample_weight=weights)
+                                               feature_selection) 
+        
+        n_features = len(used_features)
+        
+        model = WeightedRegression(n_features,ndocs)
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+    
+        X_train = torch.from_numpy(neighborhood_data[:, used_features]).float()
+        y_train = torch.from_numpy(neighborhood_labels)
+       
+      
+        for epoch in range(1000):
+            model.train()
+            optimizer.zero_grad()
 
-        local_pred = easy_model.predict(neighborhood_data[0, used_features].reshape(1, -1))
+            predictions = model(X_train)
+
+            loss = custom_loss_function(predictions, y_train, weights)
+
+            loss.backward()
+            optimizer.step()
+
+            if epoch % 100 == 0:
+                print(f'Epoch {epoch}, Loss: {loss.item()}')
+
+        
+        model_output = model(X_train)
+        prediction_score = custom_loss_function(model_output, y_train, weights).detach().numpy()
+       
+        local_pred = model(X_train[0]).detach().numpy()
+
+       
+        coefs = model.linear.weight.data.mean(dim=0).numpy()
+        intercept = model.linear.bias.detach().numpy()
 
         if self.verbose:
-            print('Intercept', easy_model.intercept_)
+            print('Intercept', intercept)
             print('Prediction_local', local_pred,)
-            print('Right:', neighborhood_labels[0, label])
-        return (easy_model.intercept_,
-                sorted(zip(used_features, easy_model.coef_),
+            print('Right:', neighborhood_labels[0])
+
+
+        return (intercept,
+                sorted(zip(used_features, coefs),
                        key=lambda x: np.abs(x[1]), reverse=True),
                 prediction_score, local_pred)
